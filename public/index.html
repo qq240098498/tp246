@@ -23,6 +23,7 @@
   <nav class="tabs" id="tabs" role="tablist">
     <button type="button" class="tab is-active" data-view="overview">概览</button>
     <button type="button" class="tab" data-view="rooms">冷库与探头</button>
+    <button type="button" class="tab" data-view="calibration">校准提醒</button>
     <button type="button" class="tab" data-view="batches">批次</button>
     <button type="button" class="tab" data-view="records">温度记录</button>
     <button type="button" class="tab" data-view="releases">放行台账</button>
@@ -87,6 +88,54 @@
                 </tr>
               </thead>
               <tbody id="probeRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="view" data-view="calibration" id="view-calibration">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>校准提醒</h2>
+            <span class="panel-hint">已逾期未处理的探头会一直挂在清单里，逾期天数按天增长</span>
+          </div>
+          <div class="cal-bar">
+            <div class="cal-bar-stats" id="calStats"></div>
+            <div class="cal-bar-tools">
+              <label>提前提醒天数</label>
+              <input type="number" min="0" step="1" id="calWarnDays" class="cal-warn-input">
+              <span class="panel-hint">改了即时生效（仅本页，不影响系统设置）</span>
+            </div>
+          </div>
+          <div class="records-note" id="calNote"></div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>编号</th><th>所属冷库</th><th>位置</th><th>台账状态</th><th>校准状态</th>
+                  <th>校准有效期</th><th class="num">剩余/逾期天数</th><th>最近一次记录时刻</th>
+                  <th>送检信息</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="calRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>送检台账</h2>
+            <span class="panel-hint">每趟送检一张单：送检时刻、送检单位、预计返回、送检人与回来后的结果</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>单号</th><th>探头</th><th>送检时刻</th><th>送检单位</th><th>预计返回</th><th>送检人</th>
+                  <th>返回时刻</th><th>结果</th><th>新有效期/处理</th><th>接收人</th>
+                </tr>
+              </thead>
+              <tbody id="calLedgerRows"></tbody>
             </table>
           </div>
         </div>

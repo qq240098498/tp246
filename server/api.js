@@ -33,7 +33,13 @@ function overview(data) {
   const readyToRelease = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && d.check.pass).length;
   const blockedCount = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && !d.check.pass).length;
   const noRecordBatches = data.batches.filter((b) => !data.records.some((r) => r.batchId === b.id)).length;
-  const expiredProbes = data.probes.filter((p) => !coldlib.probeValidOn(p, store.nowText().slice(0, 10))).length;
+  const todayDay = store.nowText().slice(0, 10);
+  const expiredProbes = data.probes.filter((p) => p.status !== '报废' && !coldlib.probeValidOn(p, todayDay)).length;
+  const dueSoonProbes = data.probes
+    .filter((p) => p.status !== '报废')
+    .filter((p) => coldlib.probeCalibrationStatus(p, todayDay, data.settings.calibrationWarnDays).state === '即将到期')
+    .length;
+  const sentProbes = data.probes.filter((p) => p.status === '送检').length;
   const mktValues = decorated.map((d) => d.check.mkt).filter((v) => v > 0);
   return {
     today: store.nowText().slice(0, 10),
@@ -42,6 +48,9 @@ function overview(data) {
     probeCount: data.probes.length,
     runningProbeCount: data.probes.filter((p) => p.status === '在用').length,
     expiredProbeCount: expiredProbes,
+    dueSoonProbeCount: dueSoonProbes,
+    sentProbeCount: sentProbes,
+    calibrationOpenCount: expiredProbes + dueSoonProbes,
     batchCount: data.batches.length,
     statusCount,
     openBatchCount: open.length,
@@ -61,6 +70,7 @@ function overview(data) {
       allowExcursionMinutes: Number(settings.allowExcursionMinutes),
       allowTotalExcursionMinutes: Number(settings.allowTotalExcursionMinutes),
       chainGapMinutes: Number(settings.chainGapMinutes),
+      calibrationWarnDays: Number(settings.calibrationWarnDays),
       recordIntervalMinutes: Number(settings.recordIntervalMinutes),
     },
     rooms: data.rooms.map((r) => {
@@ -94,6 +104,12 @@ router.get('/probes', withData((data, req) => res.listProbes(data, req.query)));
 router.post('/probes', withData((data, req) => ({ __save: true, __body: res.createProbe(data, req.body || {}) })));
 router.patch('/probes/:id', withData((data, req) => ({ __save: true, __body: res.updateProbe(data, req.params.id, req.body || {}) })));
 router.delete('/probes/:id', withData((data, req) => ({ __save: true, __body: res.removeProbe(data, req.params.id) })));
+
+// 校准提醒清单（到期/即将到期/送检中，逾期未处理的持续挂着）与送检台账
+router.get('/calibration/watch', withData((data, req) => res.listCalibrationWatch(data, req.query)));
+router.get('/calibrations', withData((data, req) => res.listCalibrations(data, req.query)));
+router.post('/probes/:id/send-calibration', withData((data, req) => ({ __save: true, __body: res.sendCalibration(data, req.params.id, req.body || {}) })));
+router.post('/calibrations/:id/return', withData((data, req) => ({ __save: true, __body: res.returnCalibration(data, req.params.id, req.body || {}) })));
 
 router.get('/batches', withData((data, req) => res.listBatches(data, req.query)));
 router.post('/batches', withData((data, req) => ({ __save: true, __body: res.createBatch(data, req.body || {}) })));

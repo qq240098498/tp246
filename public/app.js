@@ -7,8 +7,12 @@ const RECORD_PAGE = 200;
 const BATCH_STATUS = ['在库', '待放行', '已放行', '已拒收'];
 const ROOM_STATUS = ['运行', '检修', '停用'];
 const ROOM_TYPE = ['冷藏库', '冷藏车', '冷冻库'];
-const PROBE_STATUS = ['在用', '停用', '送检'];
+const PROBE_STATUS = ['在用', '停用', '送检', '报废'];
+// 台账表单只能手动置在用/停用；送检与报废走送检流程
+const PROBE_MANUAL_STATUS = ['在用', '停用'];
 const SOURCE_LIST = ['自动', '人工'];
+const CALIBRATION_RESULT = ['换证', '复校', '不合格'];
+const CALIBRATION_FAIL_ACTION = ['停用', '报废'];
 
 const state = {
   view: 'overview',
@@ -20,6 +24,9 @@ const state = {
   batchesView: [],
   recordsView: [],
   releasesView: [],
+  watchView: null,
+  calibrationsView: [],
+  calWarnDays: null,
   roomDetail: {},
   batchDetail: {},
   batchOut: {},
@@ -28,6 +35,7 @@ const state = {
   expandedBatches: new Set(),
   filters: {
     rooms: { status: '', type: '', keyword: '', probeStatus: '', probeCal: 'all' },
+    calibration: { bucket: 'open', roomId: '', status: '' },
     batches: { status: '', roomId: '', product: '', noRecord: false },
     records: { batchId: '', probeId: '', source: '', from: '', to: '' },
     releases: { decision: '' }
@@ -181,6 +189,7 @@ async function loadView(view) {
   try {
     if (view === 'overview') await loadOverview();
     else if (view === 'rooms') await loadRoomsView();
+    else if (view === 'calibration') await loadCalibrationView();
     else if (view === 'batches') await loadBatchesView();
     else if (view === 'records') await loadRecordsView();
     else if (view === 'releases') await loadReleasesView();
@@ -207,7 +216,9 @@ function renderOverview() {
   const cards = [
     { title: '冷库', value: s.roomCount, sub: '运行中 ' + s.runningRoomCount, go: { view: 'rooms' } },
     { title: '探头', value: s.probeCount, sub: '在用 ' + s.runningProbeCount, go: { view: 'rooms' } },
-    { title: '已过校准期探头', value: s.expiredProbeCount, sub: '需送检', go: { view: 'rooms', probeCal: 'expired' } },
+    { title: '已过校准期探头', value: s.expiredProbeCount, sub: '逾期未送检，持续挂账', go: { view: 'calibration', bucket: 'overdue' } },
+    { title: '即将到期探头', value: s.dueSoonProbeCount, sub: '提前 ' + num(s.settings && s.settings.calibrationWarnDays) + ' 天', go: { view: 'calibration', bucket: 'dueSoon' } },
+    { title: '送检中探头', value: s.sentProbeCount, sub: '待回来登记结果', go: { view: 'calibration', bucket: 'sent' } },
     { title: '批次', value: s.batchCount, sub: statusSummaryText(sc), go: { view: 'batches' } },
     { title: '在办批次', value: s.openBatchCount, sub: '在库与待放行', go: { view: 'batches' } },
     { title: '温度记录', value: s.recordCount, sub: '人工 ' + s.manualRecordCount, go: { view: 'records' } },
@@ -343,6 +354,227 @@ async function expandRoom(id) {
   renderRoomRows();
 }
 
+/* ---------- 校准提醒与送检 ---------- */
+
+async function loadCalibrationView() {
+  const f = state.filters.calibration;
+  const params = new URLSearchParams();
+  params.set('bucket', f.bucket || 'open');
+  if (state.calWarnDays !== null) params.set('warnDays', String(state.calWarnDays));
+  if (f.roomId) params.set('roomId', f.roomId);
+  if (f.status) params.set('status', f.status);
+  const watch = await api('GET', '/api/calibration/watch' + '?' + params.toString());
+  state.watchView = watch;
+  if (state.calWarnDays === null) state.calWarnDays = num(watch.warnDays);
+  $('calWarnDays').value = state.calWarnDays;
+  renderCalibrationRows();
+  const ledger = await api('GET', '/api/calibrations');
+  state.calibrationsView = ledger;
+  renderCalibrationLedger();
+}
+
+function calStatePill(item) {
+  if (item.status === '送检') return pill('送检中', 'pill-warn');
+  if (item.calState === '已过期') return pill('已逾期 ' + num(item.overdueDays) + ' 天', 'pill-bad');
+  if (item.calState === '即将到期') return pill('还剩 ' + num(item.daysLeft) + ' 天', 'pill-warn');
+  if (item.calState === '无校准记录') return pill('无校准记录', 'pill-bad');
+  return pill('有效（剩 ' + num(item.daysLeft) + ' 天）', 'pill-mute');
+}
+
+function statusPillForProbe(status) {
+  if (status === '在用') return pill('在用', 'pill-ok');
+  if (status === '送检') return pill('送检', 'pill-warn');
+  if (status === '报废') return pill('报废', 'pill-bad');
+  return pill(status, 'pill-mute');
+}
+
+function renderCalibrationRows() {
+  const w = state.watchView;
+  const tbody = $('calRows');
+  if (!w) return;
+  const c = w.counts || {};
+  $('calStats').innerHTML =
+    '<span class="cal-stat cal-stat-bad">已逾期 <b>' + num(c.overdue) + '</b></span>' +
+    '<span class="cal-stat cal-stat-warn">即将到期 <b>' + num(c.dueSoon) + '</b></span>' +
+    '<span class="cal-stat cal-stat-warn">送检中 <b>' + num(c.sent) + '</b></span>' +
+    '<span class="cal-stat">无校准记录 <b>' + num(c.none) + '</b></span>';
+  const f = state.filters.calibration;
+  const bucketLabel = { open: '待处理（逾期+即将到期+送检中）', overdue: '只看已逾期', dueSoon: '只看即将到期', sent: '只看送检中', ok: '只看有效', all: '全部' }[f.bucket] || '';
+  $('calNote').textContent = '今天 ' + w.today + '，提前 ' + w.warnDays + ' 天起提醒；当前显示：' + bucketLabel + '，共 ' + w.items.length + ' 支。逾期未送检的探头每天都继续挂在这里。';
+
+  if (!w.items.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">没有符合条件的探头</td></tr>';
+    return;
+  }
+  tbody.innerHTML = w.items.map(function (p) {
+    const dayCell = p.status === '送检'
+      ? '送检中'
+      : (p.calState === '已过期'
+        ? '<span class="overdue-text">逾期 ' + num(p.overdueDays) + ' 天</span>'
+        : (p.daysLeft === null ? '—' : '剩 ' + num(p.daysLeft) + ' 天'));
+    const sendInfo = p.calibrationId
+      ? '单号 ' + esc(p.calibrationId) + '<br>预计返回 ' + esc(p.expectedReturnAt)
+      : '—';
+    const action = p.status === '送检'
+      ? '<button type="button" class="btn btn-sm btn-primary" data-action="cal-return" data-id="' + esc(p.calibrationId) + '" data-probe="' + esc(p.id) + '">登记回来结果</button>'
+      : '<button type="button" class="btn btn-sm" data-action="cal-send" data-id="' + esc(p.id) + '"' + (p.status === '报废' ? ' disabled' : '') + '>登记送检</button>';
+    return '<tr class="row-main' + (p.calState === '已过期' ? ' row-danger' : '') + '" data-rowkind="watch" data-id="' + esc(p.id) + '">' +
+      '<td>' + esc(p.code) + '</td>' +
+      '<td>' + esc(p.roomCode) + '</td>' +
+      '<td>' + esc(p.position) + '</td>' +
+      '<td>' + statusPillForProbe(p.status) + '</td>' +
+      '<td>' + calStatePill(p) + '</td>' +
+      '<td>' + esc(p.calibratedUntil || '—') + '</td>' +
+      '<td class="num">' + dayCell + '</td>' +
+      '<td>' + esc(p.lastRecordAt || '从无记录') + '</td>' +
+      '<td class="cell-sub">' + sendInfo + '</td>' +
+      '<td class="cell-actions">' + action + '</td></tr>';
+  }).join('');
+}
+
+function resultText(cal) {
+  if (!cal.returnedAt) return pill('送检中', 'pill-warn');
+  if (cal.result === '不合格') return pill('不合格→' + cal.failAction, 'pill-bad');
+  return pill(cal.result, 'pill-ok');
+}
+
+function renderCalibrationLedger() {
+  const rows = state.calibrationsView || [];
+  const tbody = $('calLedgerRows');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">还没有送检单</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (c) {
+    const tail = c.result === '不合格'
+      ? esc(c.failAction)
+      : (c.newCalibratedUntil ? esc(c.newCalibratedUntil) + (c.certificateNo ? '（' + esc(c.certificateNo) + '）' : '') : '—');
+    return '<tr class="row-main' + (!c.returnedAt ? ' row-warn' : '') + '" data-rowkind="calibration" data-id="' + esc(c.id) + '">' +
+      '<td>' + esc(c.id) + '</td>' +
+      '<td>' + esc(c.probeCode) + '<div class="cell-sub">' + esc(c.roomCode) + ' ' + esc(c.position) + '</div></td>' +
+      '<td>' + esc(c.sentAt) + '</td>' +
+      '<td>' + esc(c.lab) + '</td>' +
+      '<td>' + esc(c.expectedReturnAt) + '</td>' +
+      '<td>' + esc(c.sender) + '</td>' +
+      '<td>' + esc(c.returnedAt || '—') + '</td>' +
+      '<td>' + resultText(c) + '</td>' +
+      '<td>' + tail + '</td>' +
+      '<td>' + esc(c.receiver || '—') + '</td></tr>';
+  }).join('');
+}
+
+function nowTextLocal() {
+  const d = new Date();
+  const p = function (n) { return String(n).padStart(2, '0'); };
+  // 数据口径按北京时间（UTC+8）
+  const bj = new Date(d.getTime() + (d.getTimezoneOffset() * 60000) + 8 * 3600000);
+  return bj.getUTCFullYear() + '-' + p(bj.getUTCMonth() + 1) + '-' + p(bj.getUTCDate()) + ' ' +
+    p(bj.getUTCHours()) + ':' + p(bj.getUTCMinutes()) + ':' + p(bj.getUTCSeconds());
+}
+
+function todayLocal() {
+  return nowTextLocal().slice(0, 10);
+}
+
+function affectedBatchesHtml(ab) {
+  if (!ab || !ab.count) return '<div class="field-hint">这支探头名下没有任何批次记录，本趟不涉及批次判定。</div>';
+  const rows = ab.batches.map(function (b) {
+    const passCell = function (ok) { return ok === undefined ? '—' : (ok ? pill('满足放行条件', 'pill-ok') : pill('不满足', 'pill-bad')); };
+    const changes = (b.changedConditions || []).map(function (c) {
+      const tone = c.before === '满足' && c.after === '不满足' ? 'pill-bad' : 'pill-ok';
+      return '<li>' + pill(c.before + '→' + c.after, tone) + ' ' + esc(c.text) +
+        '（实际 ' + esc(c.beforeValue) + ' → ' + esc(c.afterValue) + '）</li>';
+    }).join('') || '<li class="cell-sub">四条判定结论没有变化</li>';
+    return '<tr><td>' + esc(b.batchCode) + '</td><td>' + esc(b.product) + '</td><td>' + esc(b.status) + '</td>' +
+      '<td>' + passCell(b.beforePass) + '</td><td>' + passCell(b.afterPass) + '</td>' +
+      '<td><ul class="cond-list cond-list-compact">' + changes + '</ul></td></tr>';
+  }).join('');
+  return '<div class="impact-head">这趟送检涉及 <b>' + ab.count + '</b> 个批次，其中判定结论发生变化的 <b>' +
+    num(ab.changedCount) + '</b> 个、放行总评翻转的 <b>' + num(ab.passChangedCount) + '</b> 个（对比送检前与登记后的口径）：</div>' +
+    '<table class="mini-table"><thead><tr><th>批次</th><th>品名</th><th>状态</th><th>送检前</th><th>登记后</th><th>变化的判定结论</th></tr></thead><tbody>' +
+    rows + '</tbody></table>';
+}
+
+function openSendCalibrationModal(probeId) {
+  const p = findProbe(probeId);
+  if (!p) return;
+  const body =
+    '<div class="field-hint">探头 ' + esc(p.code) + '（' + esc(p.roomCode || '') + ' ' + esc(p.position) + '），当前校准有效期 ' + esc(p.calibratedUntil) + '</div>' +
+    '<div class="field"><label>送检时刻</label><input type="text" data-field="sentAt" value="' + esc(nowTextLocal()) + '" placeholder="2026-10-01 09:00:00"></div>' +
+    '<div class="field"><label>送检单位</label><input type="text" data-field="lab" value="" placeholder="如：市计量院"></div>' +
+    '<div class="field"><label>预计返回日期</label><input type="text" data-field="expectedReturnAt" value="" placeholder="2026-10-15"><div class="field-hint">格式：2026-10-15</div></div>' +
+    '<div class="field"><label>送检人</label><input type="text" data-field="sender" value=""></div>' +
+    '<div class="field"><label>备注</label><textarea data-field="remark"></textarea></div>' +
+    '<div class="field-hint">送检期间口径：探头状态置为「送检」，名下记录不参与批次放行判定（与停用一致）；期间到达的自动记录照常登记留痕，放行第四条会点名这支探头。</div>';
+  openModal('登记送检 · ' + p.code, body, '登记送检', async function () {
+    const v = formValues();
+    try {
+      const r = await api('POST', '/api/probes/' + encodeURIComponent(probeId) + '/send-calibration', {
+        sentAt: v.sentAt, lab: v.lab, expectedReturnAt: v.expectedReturnAt, sender: v.sender, remark: v.remark
+      });
+      closeModal();
+      await refreshAfterMutation();
+      openImpactModal('送检已登记 · ' + p.code, r);
+    } catch (err) { showError(err); }
+  });
+}
+
+function openReturnCalibrationModal(calId, probeId) {
+  const p = findProbe(probeId);
+  const body =
+    '<div class="field-hint">探头 ' + esc(p ? p.code : '') + '，送检单号 ' + esc(calId) + '</div>' +
+    '<div class="field"><label>返回时刻</label><input type="text" data-field="returnedAt" value="' + esc(nowTextLocal()) + '" placeholder="2026-10-15 14:00:00"></div>' +
+    '<div class="field"><label>送检结果</label><select data-field="result" id="calResultSelect">' +
+      CALIBRATION_RESULT.map(function (r) { return '<option value="' + esc(r) + '">' + esc(r) + '</option>'; }).join('') +
+      '</select></div>' +
+    '<div class="field" id="calPassFields">' +
+      '<label>新的校准有效期</label><input type="text" data-field="newCalibratedUntil" value="' + esc(todayLocal()) + '" placeholder="2027-10-15">' +
+      '<div class="field-hint">换证或复校：更新校准有效期，探头恢复「在用」；可登记新证书号</div>' +
+      '<label>新证书号（换证时填）</label><input type="text" data-field="certificateNo" value="">' +
+    '</div>' +
+    '<div class="field" id="calFailFields" hidden><label>不合格处理口径</label><select data-field="failAction">' +
+      CALIBRATION_FAIL_ACTION.map(function (r) { return '<option value="' + esc(r) + '">' + esc(r) + '</option>'; }).join('') +
+      '</select><div class="field-hint">停用：探头置「停用」，名下记录不参与判定，可整改后重新送检；报废：置「报废」，永久不参与判定、不再出现在提醒清单。</div></div>' +
+    '<div class="field"><label>接收人</label><input type="text" data-field="receiver" value=""></div>' +
+    '<div class="field"><label>结果备注</label><textarea data-field="resultRemark"></textarea></div>';
+  openModal('登记送检结果 · ' + (p ? p.code : calId), body, '登记结果', async function () {
+    const v = formValues();
+    const payload = {
+      returnedAt: v.returnedAt,
+      result: v.result,
+      receiver: v.receiver,
+      resultRemark: v.resultRemark
+    };
+    if (v.result === '不合格') payload.failAction = v.failAction;
+    else { payload.newCalibratedUntil = v.newCalibratedUntil; payload.certificateNo = v.certificateNo; }
+    try {
+      const r = await api('POST', '/api/calibrations/' + encodeURIComponent(calId) + '/return', payload);
+      closeModal();
+      await refreshAfterMutation();
+      openImpactModal('送检结果已登记 · ' + (p ? p.code : calId), r);
+    } catch (err) { showError(err); }
+  });
+  // 结果切换时展开对应字段
+  setTimeout(function () {
+    const sel = $('calResultSelect');
+    const sync = function () {
+      const fail = sel.value === '不合格';
+      $('calPassFields').hidden = fail;
+      $('calFailFields').hidden = !fail;
+    };
+    sel.addEventListener('change', sync);
+    sync();
+  }, 0);
+}
+
+function openImpactModal(title, r) {
+  const probeLine = r.probe
+    ? '<div class="field-hint">探头 ' + esc(r.probe.code) + ' 当前状态：' + esc(r.probe.status) +
+      (r.probe.calibratedUntil ? '，校准有效期 ' + esc(r.probe.calibratedUntil) : '') + '</div>'
+    : '';
+  openModal(title, probeLine + affectedBatchesHtml(r.affectedBatches), '知道了', function () { closeModal(); });
+}
+
 /* ---------- 批次 ---------- */
 
 async function loadBatchesView() {
@@ -403,7 +635,7 @@ function batchDetailRow(b) {
     return '<tr><td>' + esc(r.at) + '</td><td>' + esc(r.probeCode) + '</td><td class="num">' + num(r.temperatureC) + '</td>' +
       '<td>' + esc(r.source) + '</td>' +
       '<td>' + (oor ? pill('超限', 'pill-bad') : pill('正常', 'pill-mute')) + '</td>' +
-      '<td>' + (r.probeExpired ? pill('已过期', 'pill-bad') : pill('有效', 'pill-mute')) + '</td></tr>';
+      '<td>' + (r.probeExpired ? pill(r.probeUsableReason || '不参与判定', 'pill-bad') : pill('有效', 'pill-mute')) + '</td></tr>';
   }).join('') || '<tr><td colspan="6" class="empty">没有温度记录</td></tr>';
 
   let segmentsHtml;
@@ -426,15 +658,18 @@ function batchDetailRow(b) {
   const check = d.releaseCheck || {};
   const conds = (check.conditions || []).slice();
   const expired = check.expiredProbes || [];
-  conds.push({ key: 'calibration', ok: expired.length === 0, value: expired.length, limit: 0, text: '参与判定的探头都在校准有效期内' });
+  // 无记录硬门槛与四条分开显示
+  const hasRecords = check.hasRecords !== undefined ? check.hasRecords : num(check.recordCount) > 0;
   const condHtml = conds.map(function (c) {
     return '<li><span class="cond-text">' + okPill(c.ok) + ' ' + esc(c.text) + '</span>' +
       '<span class="cond-meta">实际 ' + esc(c.value) + '，阈值 ' + esc(c.limit) + '</span></li>';
-  }).join('');
+  }).join('') +
+    '<li><span class="cond-text">' + okPill(hasRecords) + ' 有温度记录</span>' +
+    '<span class="cond-meta">实际 ' + num(check.recordCount) + ' 条，一条都没有的批次不能放行</span></li>';
 
   const expiredProbes = expired.map(function (p) {
-    return '<tr><td>' + esc(p.probeCode) + '</td><td>' + esc(p.calibratedUntil) + '</td><td>' + esc(p.at) + '</td></tr>';
-  }).join('') || '<tr><td colspan="3" class="empty">没有已过校准期的探头</td></tr>';
+    return '<tr><td>' + esc(p.probeCode) + '</td><td>' + esc(p.status || '—') + '</td><td>' + esc(p.calibratedUntil) + '</td><td>' + esc(p.at) + '</td><td>' + esc(p.reason || '已过校准期') + '</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="empty">没有不参与判定的探头</td></tr>';
 
   const releases = (d.releases || []).map(function (r) {
     return '<tr><td>' + esc(r.decision) + '</td><td>' + esc(r.decidedAt) + '</td><td>' + esc(r.decider) + '</td>' +
@@ -455,8 +690,8 @@ function batchDetailRow(b) {
     '<h4>断链缺口（' + (d.chainGaps || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>起</th><th>止</th><th class="num">实际(分)</th><th class="num">计入(分)</th></tr></thead><tbody>' + gaps + '</tbody></table></div>' +
     '<div class="detail-block"><h4>放行判定</h4><ul class="cond-list">' + condHtml + '</ul>' +
-    '<h4>已过校准期的探头（' + expired.length + '）</h4>' +
-    '<table class="mini-table"><thead><tr><th>探头</th><th>校准有效期</th><th>记录时刻</th></tr></thead><tbody>' + expiredProbes + '</tbody></table></div>' +
+    '<h4>不参与判定的探头（' + expired.length + '）</h4>' +
+    '<table class="mini-table"><thead><tr><th>探头</th><th>台账状态</th><th>校准有效期</th><th>相关记录时刻</th><th>原因</th></tr></thead><tbody>' + expiredProbes + '</tbody></table></div>' +
     '<div class="detail-block"><h4>放行记录（' + (d.releases || []).length + '）</h4>' +
     '<table class="mini-table"><thead><tr><th>决定</th><th>时刻</th><th>经办人</th><th class="num">MKT</th><th>依据</th></tr></thead><tbody>' + releases + '</tbody></table>' +
     decisionBtns + '</div>' +
@@ -617,6 +852,25 @@ function renderFilters() {
       '<h3>探头筛选</h3>' +
       '<div class="filter-field"><label>状态</label>' + selectHtml('probeStatus', [{ value: '', label: '全部' }].concat(PROBE_STATUS.map(function (s) { return { value: s, label: s }; })), f.probeStatus) + '</div>' +
       '<div class="filter-field"><label>校准</label>' + selectHtml('probeCal', [{ value: 'all', label: '全部' }, { value: 'expired', label: '已过期' }, { value: 'valid', label: '有效' }], f.probeCal) + '</div>';
+  } else if (v === 'calibration') {
+    const f = state.filters.calibration;
+    const roomSel = [{ value: '', label: '全部' }].concat(state.rooms.map(function (r) { return { value: r.id, label: r.code + ' ' + r.name }; }));
+    html = '<h3>校准提醒筛选</h3>' +
+      '<div class="filter-field"><label>范围</label>' + selectHtml('bucket', [
+        { value: 'open', label: '待处理（逾期+即将到期+送检中）' },
+        { value: 'overdue', label: '只看已逾期' },
+        { value: 'dueSoon', label: '只看即将到期' },
+        { value: 'sent', label: '只看送检中' },
+        { value: 'all', label: '全部探头（含有效）' }
+      ], f.bucket) + '</div>' +
+      '<div class="filter-field"><label>所属冷库</label>' + selectHtml('roomId', roomSel, f.roomId) + '</div>' +
+      '<div class="filter-field"><label>台账状态</label>' + selectHtml('status', [
+        { value: '', label: '全部' },
+        { value: '在用', label: '在用' },
+        { value: '送检', label: '送检' },
+        { value: '停用', label: '停用' }
+      ], f.status) + '</div>' +
+      '<div class="filter-hint">提前多少天提醒在右侧页面上直接改；逾期不处理的探头会一直挂在「已逾期」里。</div>';
   } else if (v === 'batches') {
     const f = state.filters.batches;
     const roomSel = [{ value: '', label: '全部' }].concat(state.rooms.map(function (r) { return { value: r.id, label: r.code + ' ' + r.name }; }));
@@ -666,6 +920,7 @@ function openSettings() {
     '<div class="field"><label>单次允许超限（分钟）</label><input type="number" step="1" data-field="allowExcursionMinutes" value="' + esc(s.allowExcursionMinutes) + '"></div>' +
     '<div class="field"><label>累计允许超限（分钟）</label><input type="number" step="1" data-field="allowTotalExcursionMinutes" value="' + esc(s.allowTotalExcursionMinutes) + '"></div>' +
     '<div class="field"><label>断链门槛（分钟）</label><input type="number" step="1" data-field="chainGapMinutes" value="' + esc(s.chainGapMinutes) + '"></div>' +
+    '<div class="field"><label>校准提前提醒天数</label><input type="number" step="1" min="0" data-field="calibrationWarnDays" value="' + esc(s.calibrationWarnDays) + '"><div class="field-hint">校准有效期到期前多少天开始进「即将到期」清单；校准页上还能临时改</div></div>' +
     '<div class="field"><label>记录间隔（分钟）</label><input type="number" step="1" data-field="recordIntervalMinutes" value="' + esc(s.recordIntervalMinutes) + '"></div>';
   openModal('设置', body, '保存', async function () {
     const v = formValues();
@@ -675,6 +930,7 @@ function openSettings() {
       allowExcursionMinutes: Number(v.allowExcursionMinutes),
       allowTotalExcursionMinutes: Number(v.allowTotalExcursionMinutes),
       chainGapMinutes: Number(v.chainGapMinutes),
+      calibrationWarnDays: Number(v.calibrationWarnDays),
       recordIntervalMinutes: Number(v.recordIntervalMinutes)
     };
     try {
@@ -714,11 +970,16 @@ function openRoomForm(room) {
 function openProbeForm(probe) {
   const isEdit = !!probe;
   const p = probe || { code: '', roomId: state.rooms.length ? state.rooms[0].id : '', position: '', status: '在用', calibratedUntil: '', remark: '' };
+  const lockedStatus = (p.status === '送检' || p.status === '报废');
+  const statusField = lockedStatus
+    ? '<div class="field"><label>状态</label><input type="text" value="' + esc(p.status) + '（由送检流程管理）" disabled>' +
+      '<input type="hidden" data-field="status" value="' + esc(p.status) + '"></div>'
+    : '<div class="field"><label>状态</label><select data-field="status">' + PROBE_MANUAL_STATUS.map(function (t) { return '<option value="' + esc(t) + '"' + (t === p.status ? ' selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select><div class="field-hint">送检与报废请到「校准提醒」页走送检流程</div></div>';
   const body =
     '<div class="field"><label>编号</label><input type="text" data-field="code" value="' + esc(p.code) + '"' + (isEdit ? ' disabled' : '') + '></div>' +
     '<div class="field"><label>所属冷库</label><select data-field="roomId">' + roomOptions(p.roomId) + '</select></div>' +
     '<div class="field"><label>位置</label><input type="text" data-field="position" value="' + esc(p.position) + '"></div>' +
-    '<div class="field"><label>状态</label><select data-field="status">' + PROBE_STATUS.map(function (t) { return '<option value="' + esc(t) + '"' + (t === p.status ? ' selected' : '') + '>' + esc(t) + '</option>'; }).join('') + '</select></div>' +
+    statusField +
     '<div class="field"><label>校准有效期</label><input type="text" data-field="calibratedUntil" value="' + esc(p.calibratedUntil) + '" placeholder="2026-12-31"><div class="field-hint">格式：2026-12-31</div></div>' +
     '<div class="field"><label>备注</label><textarea data-field="remark">' + esc(p.remark) + '</textarea></div>';
   openModal(isEdit ? '修改探头' : '新增探头', body, isEdit ? '保存' : '新增', async function () {
@@ -835,6 +1096,7 @@ async function handleAction(action, el) {
     if (action === 'card-go') {
       const go = JSON.parse(el.dataset.go || '{}');
       if (go.view === 'rooms' && go.probeCal) state.filters.rooms.probeCal = go.probeCal;
+      if (go.view === 'calibration' && go.bucket) state.filters.calibration.bucket = go.bucket;
       if (go.view === 'batches' && go.noRecord) state.filters.batches.noRecord = true;
       await switchView(go.view);
       return;
@@ -860,8 +1122,7 @@ async function handleAction(action, el) {
       return;
     }
     if (action === 'probe-add') { openProbeForm(null); return; }
-    if (action === 'probe-edit') { openProbeForm(findProbe(el.dataset.id)); return; }
-    if (action === 'probe-del') {
+    if (action === 'probe-edit') { openProbeForm(findProbe(el.dataset.id)); return; }    if (action === 'probe-del') {
       const id = el.dataset.id;
       armDelete(el, async function () {
         try {
@@ -871,6 +1132,8 @@ async function handleAction(action, el) {
       });
       return;
     }
+    if (action === 'cal-send') { openSendCalibrationModal(el.dataset.id); return; }
+    if (action === 'cal-return') { openReturnCalibrationModal(el.dataset.id, el.dataset.probe); return; }
     if (action === 'batch-release' || action === 'batch-reject') {
       const batch = findBatch(el.dataset.id);
       if (batch) openDecisionModal(batch, action === 'batch-release' ? '放行' : '拒收');
@@ -929,6 +1192,15 @@ document.body.addEventListener('click', function (e) {
 
 $('filters').addEventListener('change', onFilterInput);
 $('filters').addEventListener('input', onFilterInput);
+
+let warnTimer = null;
+$('calWarnDays').addEventListener('input', function (e) {
+  const n = Number(e.target.value);
+  if (!Number.isFinite(n) || n < 0) return;
+  state.calWarnDays = Math.floor(n);
+  if (warnTimer) clearTimeout(warnTimer);
+  warnTimer = setTimeout(function () { loadCalibrationView().catch(showError); }, 300);
+});
 
 $('modalClose').addEventListener('click', closeModal);
 $('modalCancel').addEventListener('click', closeModal);

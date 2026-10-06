@@ -13,13 +13,14 @@ const DEFAULT_SETTINGS = {
   mktActivationEnergy: 83144,
   gasConstant: 8.314,
   probeCalibrationGraceDays: 0,
+  calibrationWarnDays: 30,
   recordIntervalMinutes: 15,
 };
 
 function normalize(raw) {
   const data = raw && typeof raw === 'object' ? raw : {};
   data.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings || {});
-  for (const key of ['rooms', 'probes', 'batches', 'records', 'releases']) {
+  for (const key of ['rooms', 'probes', 'batches', 'records', 'releases', 'calibrations']) {
     if (!Array.isArray(data[key])) data[key] = [];
   }
   return data;
@@ -72,4 +73,14 @@ function nowText() {
   return now.getUTCFullYear() + '-' + p(now.getUTCMonth() + 1) + '-' + p(now.getUTCDate()) + ' ' + p(now.getUTCHours()) + ':' + p(now.getUTCMinutes()) + ':' + p(now.getUTCSeconds());
 }
 
-module.exports = { load, save, nextId, normalize, round, minutesBetween, nowText, DEFAULT_SETTINGS, dataFile };
+function todayText() {
+  return nowText().slice(0, 10);
+}
+
+// 两个 YYYY-MM-DD 之间相差的天数（b - a），按北京时间的日历日算
+function daysBetween(a, b) {
+  const toDay = (s) => new Date(String(s).slice(0, 10) + 'T00:00:00+08:00');
+  return Math.round((toDay(b) - toDay(a)) / 86400000);
+}
+
+module.exports = { load, save, nextId, normalize, round, minutesBetween, daysBetween, nowText, todayText, DEFAULT_SETTINGS, dataFile };

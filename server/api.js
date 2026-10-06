@@ -33,7 +33,15 @@ function overview(data) {
   const readyToRelease = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && d.check.pass).length;
   const blockedCount = decorated.filter((d) => (d.batch.status === '在库' || d.batch.status === '待放行') && !d.check.pass).length;
   const noRecordBatches = data.batches.filter((b) => !data.records.some((r) => r.batchId === b.id)).length;
-  const expiredProbes = data.probes.filter((p) => !coldlib.probeValidOn(p, store.nowText().slice(0, 10))).length;
+  const today = store.nowText().slice(0, 10);
+  const remindDays = Math.max(0, Number(settings.calibrationRemindDays) || 0);
+  const activeProbes = data.probes.filter((p) => p.status === '在用' && p.calibratedUntil);
+  const expiredProbes = activeProbes.filter((p) => !coldlib.probeValidOn(p, today)).length;
+  const dueSoonProbes = activeProbes.filter((p) => {
+    const left = coldlib.daysBetween(today, p.calibratedUntil);
+    return left >= 0 && left <= remindDays;
+  }).length;
+  const inCalibrationCount = data.calibrations.filter((c) => c.status === '送检中').length;
   const mktValues = decorated.map((d) => d.check.mkt).filter((v) => v > 0);
   return {
     today: store.nowText().slice(0, 10),
@@ -42,6 +50,8 @@ function overview(data) {
     probeCount: data.probes.length,
     runningProbeCount: data.probes.filter((p) => p.status === '在用').length,
     expiredProbeCount: expiredProbes,
+    dueSoonProbeCount: dueSoonProbes,
+    inCalibrationCount,
     batchCount: data.batches.length,
     statusCount,
     openBatchCount: open.length,
@@ -62,6 +72,7 @@ function overview(data) {
       allowTotalExcursionMinutes: Number(settings.allowTotalExcursionMinutes),
       chainGapMinutes: Number(settings.chainGapMinutes),
       recordIntervalMinutes: Number(settings.recordIntervalMinutes),
+      calibrationRemindDays: Number(settings.calibrationRemindDays),
     },
     rooms: data.rooms.map((r) => {
       const probes = data.probes.filter((p) => p.roomId === r.id);
@@ -112,6 +123,12 @@ router.post('/records', withData((data, req) => ({ __save: true, __body: res.cre
 router.delete('/records/:id', withData((data, req) => ({ __save: true, __body: res.removeRecord(data, req.params.id) })));
 
 router.get('/releases', withData((data, req) => res.listReleases(data, req.query)));
+
+router.get('/calibrations', withData((data, req) => res.listCalibrations(data, req.query)));
+router.get('/calibrations/due', withData((data) => res.calibrationDueList(data)));
+router.post('/probes/:id/dispatch', withData((data, req) => ({ __save: true, __body: res.dispatchProbe(data, req.params.id, req.body || {}) })));
+router.post('/calibrations/:id/result', withData((data, req) => ({ __save: true, __body: res.completeCalibration(data, req.params.id, req.body || {}) })));
+router.delete('/calibrations/:id', withData((data, req) => ({ __save: true, __body: res.cancelCalibration(data, req.params.id) })));
 
 router.use((req, r, next) => next(new AppError(404, 'NOT_FOUND', '这个地址没有对应功能：' + req.method + ' ' + req.originalUrl)));
 

@@ -23,6 +23,7 @@
   <nav class="tabs" id="tabs" role="tablist">
     <button type="button" class="tab is-active" data-view="overview">概览</button>
     <button type="button" class="tab" data-view="rooms">冷库与探头</button>
+    <button type="button" class="tab" data-view="calibration">校准与送检</button>
     <button type="button" class="tab" data-view="batches">批次</button>
     <button type="button" class="tab" data-view="records">温度记录</button>
     <button type="button" class="tab" data-view="releases">放行台账</button>
@@ -87,6 +88,84 @@
                 </tr>
               </thead>
               <tbody id="probeRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="view" data-view="calibration" id="view-calibration">
+        <div class="panel">
+          <div class="records-note">口径：到期提醒只统计「在用」探头；已过期探头一直挂在下面清单里并累计逾期天数，直到登记送检或者更新校准有效期，不会提醒一次就消失。停用、送检中、报废探头名下的温度记录不参与超限、断链、MKT 与放行判定。提前多少天提醒在左侧「提醒设置」里改。</div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>已过期（持续提醒）</h2>
+            <span class="panel-hint" id="calExpiredNote"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>探头</th><th>所属冷库</th><th>位置</th><th>校准有效期</th>
+                  <th>最近记录时刻</th><th class="num">逾期天数</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="calExpiredRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>即将到期</h2>
+            <span class="panel-hint" id="calDueSoonNote"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>探头</th><th>所属冷库</th><th>位置</th><th>校准有效期</th>
+                  <th>最近记录时刻</th><th class="num">剩余天数</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="calDueSoonRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>送检中</h2>
+            <span class="panel-hint">超过预计返回日期会标注超期天数</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>探头</th><th>所属冷库</th><th>送检时刻</th><th>送检单位</th><th>送检人</th>
+                  <th>预计返回</th><th class="num">已送天数</th><th>超期未归</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="calInRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>送检台账</h2>
+            <span class="panel-hint">点一行展开涉及批次与判定结论变化</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>探头</th><th>所属冷库</th><th>送检时刻</th><th>送检单位</th><th>结果</th>
+                  <th>新有效期 / 处理</th><th class="num">涉及批次</th><th class="num">结论变化</th><th>结果登记时刻</th>
+                </tr>
+              </thead>
+              <tbody id="calibrationRows"></tbody>
             </table>
           </div>
         </div>

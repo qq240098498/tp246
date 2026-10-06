@@ -4,13 +4,20 @@ const coldlib = require('./coldlib');
 
 const ROOM_STATUS = ['运行', '检修', '停用'];
 const ROOM_TYPE = ['冷藏库', '冷藏车', '冷冻库'];
-const PROBE_STATUS = ['在用', '停用', '送检'];
+const PROBE_STATUS = ['在用', '停用', '送检', '报废'];
 const BATCH_STATUS = ['在库', '待放行', '已放行', '已拒收'];
 const SOURCE_LIST = ['自动', '人工'];
+const CALIBRATION_STATUS = ['送检中', '已完成'];
+const CALIBRATION_RESULT = ['换证', '复校', '不合格'];
+const CALIBRATION_HANDLING = ['停用', '报废'];
 
 function roomCode(data, id) {
   const room = data.rooms.find((r) => r.id === id);
   return room ? room.code : '';
+}
+function roomName(data, id) {
+  const room = data.rooms.find((r) => r.id === id);
+  return room ? room.name : '';
 }
 function batchCode(data, id) {
   const batch = data.batches.find((b) => b.id === id);
@@ -368,11 +375,195 @@ function decide(data, batchId, payload) {
   return { release, batch: decorateBatch(data, batch) };
 }
 
+/* ---------- 探头校准与送检 ---------- */
+
+function decorateCalibration(data, cal) {
+  const probe = coldlib.probeOf(data, cal.probeId);
+  const today = store.nowText().slice(0, 10);
+  const sentDay = String(cal.sentAt || '').slice(0, 10);
+  const endDay = cal.status === '送检中' ? today : String(cal.resultAt || '').slice(0, 10);
+  return Object.assign({}, cal, {
+    probeCode: probe ? probe.code : '',
+    probeStatus: probe ? probe.status : '',
+    roomCode: probe ? roomCode(data, probe.roomId) : '',
+    roomName: probe ? roomName(data, probe.roomId) : '',
+    position: probe ? probe.position : '',
+    daysOut: sentDay && endDay ? coldlib.daysBetween(sentDay, endDay) : 0,
+    lateDays: cal.expectedBack && endDay ? Math.max(0, coldlib.daysBetween(String(cal.expectedBack), endDay)) : 0,
+  });
+}
+
+function listCalibrations(data, query) {
+  const q = query || {};
+  let rows = data.calibrations.slice();
+  if (q.probeId) rows = rows.filter((c) => c.probeId === q.probeId);
+  if (q.status) rows = rows.filter((c) => c.status === q.status);
+  return rows.map((c) => decorateCalibration(data, c)).sort((a, b) => (a.sentAt < b.sentAt ? 1 : -1));
+}
+
+// 到期提醒清单：只盯在用探头；已过期的一直挂着并累计逾期天数，直到送检或者更新有效期
+function calibrationDueList(data) {
+  const today = store.nowText().slice(0, 10);
+  const remindDays = Math.max(0, Number(data.settings.calibrationRemindDays) || 0);
+  const expired = [];
+  const dueSoon = [];
+  for (const p of data.probes) {
+    if (p.status !== '在用') continue;
+    if (!p.calibratedUntil) continue;
+    const daysLeft = coldlib.daysBetween(today, p.calibratedUntil);
+    const row = {
+      probeId: p.id,
+      code: p.code,
+      roomCode: roomCode(data, p.roomId),
+      roomName: roomName(data, p.roomId),
+      position: p.position,
+      status: p.status,
+      calibratedUntil: p.calibratedUntil,
+      lastRecordAt: coldlib.lastRecordAt(data, p.id),
+      daysLeft,
+    };
+    if (daysLeft < 0) expired.push(Object.assign({}, row, { overdueDays: -daysLeft }));
+    else if (daysLeft <= remindDays) dueSoon.push(row);
+  }
+  expired.sort((a, b) => (b.overdueDays - a.overdueDays) || (a.code < b.code ? -1 : 1));
+  dueSoon.sort((a, b) => (a.daysLeft - b.daysLeft) || (a.code < b.code ? -1 : 1));
+  const inCalibration = data.calibrations
+    .filter((c) => c.status === '送检中')
+    .map((c) => decorateCalibration(data, c))
+    .sort((a, b) => (a.sentAt < b.sentAt ? 1 : -1));
+  return { today, remindDays, expired, dueSoon, inCalibration };
+}
+
+// 这趟送检涉及的批次：在办（在库/待放行）且名下有这个探头记录的批次
+function affectedBatches(data, probeId) {
+  const batchIds = {};
+  for (const r of data.records) {
+    if (r.probeId === probeId) batchIds[r.batchId] = true;
+  }
+  return data.batches.filter((b) => batchIds[b.id] && (b.status === '在库' || b.status === '待放行'));
+}
+
+function checkSnapshot(data, batch) {
+  const check = coldlib.releaseCheck(data, batch);
+  return {
+    batchId: batch.id,
+    code: batch.code,
+    pass: check.pass,
+    ok: check.pass && check.expiredProbes.length === 0 && check.recordCount > 0,
+    failed: check.failed,
+    expiredProbeCodes: check.expiredProbes.map((p) => p.probeCode),
+    recordCount: check.recordCount,
+  };
+}
+
+// 登记送检：建送检单、探头转「送检」，并快照涉及批次当时的判定结论
+function dispatchProbe(data, probeId, payload) {
+  const probe = data.probes.find((p) => p.id === probeId);
+  if (!probe) throw new AppError(404, 'PROBE_NOT_FOUND', '这个探头不存在');
+  if (probe.status === '报废') throw new AppError(409, 'PROBE_SCRAPPED', '报废探头不再送检', { code: probe.code });
+  const open = data.calibrations.find((c) => c.probeId === probeId && c.status === '送检中');
+  if (open) throw new AppError(409, 'CALIBRATION_OPEN', '这个探头已有在途送检单（' + open.id + '），先登记结果或者撤销', { calibrationId: open.id });
+  const errors = {};
+  if (!String(payload.agency || '').trim()) errors.agency = '送检单位不能为空';
+  if (!String(payload.sentBy || '').trim()) errors.sentBy = '送检人不能为空';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(payload.expectedBack || ''))) errors.expectedBack = '预计返回日期要像 2026-10-15';
+  if (payload.sentAt && !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(payload.sentAt))) errors.sentAt = '送检时刻格式要像 2026-10-04 09:00:00';
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '送检登记有几项没通过校验', errors);
+  const beforeChecks = affectedBatches(data, probe.id).map((b) => checkSnapshot(data, b));
+  const cal = {
+    id: store.nextId('cal', data.calibrations),
+    probeId: probe.id,
+    sentAt: String(payload.sentAt || store.nowText()),
+    agency: String(payload.agency).trim(),
+    sentBy: String(payload.sentBy).trim(),
+    expectedBack: String(payload.expectedBack),
+    status: '送检中',
+    remark: String(payload.remark || '').trim(),
+    beforeChecks,
+  };
+  data.calibrations.push(cal);
+  probe.status = '送检';
+  return decorateCalibration(data, cal);
+}
+
+// 登记结果：换证/复校更新校准有效期并回到在用；不合格按口径停用或者报废；
+// 并给出这一趟涉及哪些批次、哪些批次的判定结论发生了变化
+function completeCalibration(data, calId, payload) {
+  const cal = data.calibrations.find((c) => c.id === calId);
+  if (!cal) throw new AppError(404, 'CALIBRATION_NOT_FOUND', '这趟送检不存在');
+  if (cal.status !== '送检中') throw new AppError(409, 'CALIBRATION_DONE', '这趟送检已经登记过结果', { id: cal.id });
+  const probe = coldlib.probeOf(data, cal.probeId);
+  if (!probe) throw new AppError(404, 'PROBE_NOT_FOUND', '送检单名下的探头不存在');
+  const result = String(payload.result || '');
+  const errors = {};
+  if (!CALIBRATION_RESULT.includes(result)) errors.result = '结果只能是：' + CALIBRATION_RESULT.join('、');
+  if ((result === '换证' || result === '复校') && !/^\d{4}-\d{2}-\d{2}$/.test(String(payload.newCalibratedUntil || ''))) {
+    errors.newCalibratedUntil = '换证或者复校要填新的校准有效期，格式像 2027-10-13';
+  }
+  if (result === '不合格' && !CALIBRATION_HANDLING.includes(payload.handling)) {
+    errors.handling = '不合格时要选处理方式：' + CALIBRATION_HANDLING.join('、');
+  }
+  if (payload.resultAt && !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(payload.resultAt))) {
+    errors.resultAt = '结果登记时刻格式要像 2026-10-14 10:00:00';
+  }
+  if (Object.keys(errors).length) throw new AppError(400, 'VALIDATION_FAILED', '送检结果有几项没通过校验', errors);
+
+  cal.result = result;
+  cal.resultAt = String(payload.resultAt || store.nowText());
+  cal.status = '已完成';
+  cal.resultRemark = String(payload.remark || '').trim();
+  if (result === '换证' || result === '复校') {
+    cal.newCalibratedUntil = String(payload.newCalibratedUntil);
+    probe.calibratedUntil = cal.newCalibratedUntil;
+    probe.status = '在用';
+  } else {
+    cal.handling = payload.handling;
+    probe.status = payload.handling;
+  }
+
+  const beforeMap = {};
+  for (const s of cal.beforeChecks || []) beforeMap[s.batchId] = s;
+  const afterList = affectedBatches(data, cal.probeId).map((b) => checkSnapshot(data, b));
+  const afterMap = {};
+  for (const s of afterList) afterMap[s.batchId] = s;
+  const ids = [];
+  for (const id of Object.keys(beforeMap).concat(Object.keys(afterMap))) {
+    if (ids.indexOf(id) === -1) ids.push(id);
+  }
+  const rows = ids.map((id) => {
+    const before = beforeMap[id] || null;
+    const after = afterMap[id] || null;
+    const changed = !!(before && after && (
+      before.ok !== after.ok ||
+      before.pass !== after.pass ||
+      JSON.stringify(before.failed) !== JSON.stringify(after.failed) ||
+      JSON.stringify(before.expiredProbeCodes) !== JSON.stringify(after.expiredProbeCodes)
+    ));
+    return { batchId: id, code: (before || after).code, before, after, changed };
+  });
+  rows.sort((a, b) => (a.changed === b.changed ? (a.code < b.code ? -1 : 1) : a.changed ? -1 : 1));
+  cal.impact = { batches: rows, changedCount: rows.filter((r) => r.changed).length };
+  return { calibration: decorateCalibration(data, cal), impact: cal.impact };
+}
+
+// 撤销在途送检：删掉送检单，探头回到「在用」
+function cancelCalibration(data, calId) {
+  const cal = data.calibrations.find((c) => c.id === calId);
+  if (!cal) throw new AppError(404, 'CALIBRATION_NOT_FOUND', '这趟送检不存在');
+  if (cal.status !== '送检中') throw new AppError(409, 'CALIBRATION_DONE', '只有送检中的单子能撤销', { id: cal.id });
+  data.calibrations = data.calibrations.filter((c) => c.id !== calId);
+  const probe = coldlib.probeOf(data, cal.probeId);
+  if (probe && probe.status === '送检') probe.status = '在用';
+  return { removed: calId };
+}
+
 module.exports = {
   listRooms, roomDetail, createRoom, updateRoom, removeRoom,
   listProbes, createProbe, updateProbe, removeProbe,
   listBatches, batchDetail, createBatch, updateBatch, removeBatch,
   listRecords, createRecord, removeRecord,
   listReleases, decide,
+  listCalibrations, calibrationDueList, dispatchProbe, completeCalibration, cancelCalibration,
   ROOM_STATUS, ROOM_TYPE, PROBE_STATUS, BATCH_STATUS, SOURCE_LIST,
+  CALIBRATION_STATUS, CALIBRATION_RESULT, CALIBRATION_HANDLING,
 };

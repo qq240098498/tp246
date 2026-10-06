@@ -16,9 +16,16 @@ function probeOf(data, probeId) {
   return data.probes.find((p) => p.id === probeId) || null;
 }
 
+// 停用、送检中、报废探头名下的记录不参与判定；探头已被删除时记录照旧参与
+const PROBE_JUDGE_EXCLUDED = ['停用', '送检', '报废'];
+function probeInJudgement(probe) {
+  if (!probe) return true;
+  return PROBE_JUDGE_EXCLUDED.indexOf(probe.status) === -1;
+}
+
 // 同一探头同一时刻既有自动记录又有手工更正时，以手工为准
 function effectiveRecords(data, batchId) {
-  const rows = recordsOfBatch(data, batchId);
+  const rows = recordsOfBatch(data, batchId).filter((r) => probeInJudgement(probeOf(data, r.probeId)));
   const picked = {};
   const order = [];
   for (const row of rows) {
@@ -102,6 +109,22 @@ function probeValidOn(probe, day) {
   return String(day) <= String(probe.calibratedUntil);
 }
 
+// 两个日期串（2026-10-04）之间相差的天数：b 减 a，可正可负
+function daysBetween(a, b) {
+  const da = new Date(String(a).slice(0, 10) + 'T00:00:00+08:00');
+  const db = new Date(String(b).slice(0, 10) + 'T00:00:00+08:00');
+  return Math.round((db - da) / 86400000);
+}
+
+// 探头名下最近一次记录时刻，没有记录返回空串
+function lastRecordAt(data, probeId) {
+  let last = '';
+  for (const r of data.records) {
+    if (r.probeId === probeId && String(r.at) > last) last = String(r.at);
+  }
+  return last;
+}
+
 function expiredProbes(data, batchId, day) {
   const rows = effectiveRecords(data, batchId);
   const bad = [];
@@ -160,12 +183,16 @@ function releaseCheck(data, batch) {
 module.exports = {
   toDate,
   probeOf,
+  probeInJudgement,
+  PROBE_JUDGE_EXCLUDED,
   recordsOfBatch,
   effectiveRecords,
   excursionStats,
   chainGaps,
   mktCelsius,
   probeValidOn,
+  daysBetween,
+  lastRecordAt,
   expiredProbes,
   accumulatedExcursionMinutes,
   monthlyExcursionMinutes,
